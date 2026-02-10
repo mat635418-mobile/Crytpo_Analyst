@@ -4,324 +4,286 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objs as go
 import plotly.express as px
-from sklearn.model_selection import train_test_split
+from scipy.optimize import minimize
 from sklearn.ensemble import RandomForestRegressor
-from sklearn.metrics import mean_absolute_error
+from sklearn.model_selection import train_test_split
 from datetime import date, timedelta
 
 # --- PAGE CONFIGURATION ---
-st.set_page_config(page_title="Pro Crypto Analyst", layout="wide", page_icon="📈")
+st.set_page_config(page_title="Hedge Fund Terminal", layout="wide", page_icon="🏦")
 
 # --- CUSTOM CSS ---
 st.markdown("""
 <style>
-    .metric-container {
-        background-color: #f0f2f6;
-        padding: 10px;
-        border-radius: 10px;
+    .metric-card {
+        background-color: #0e1117;
+        border: 1px solid #262730;
+        border-radius: 5px;
+        padding: 15px;
+        color: white;
+    }
+    .risk-alert {
+        color: #ff4b4b;
+        font-weight: bold;
     }
 </style>
 """, unsafe_allow_html=True)
 
-st.title("📈 Pro Crypto Analyst & AI Forecaster")
-st.markdown("Advanced dashboard for Crypto analysis, Monte Carlo simulation, and AI-driven trend prediction.")
+st.title("🏦 Institutional Crypto Terminal")
+st.markdown("Advanced Portfolio Optimization, Risk Management (VaR/CVaR), and Macro-Regime Filtering.")
 
 # --- SIDEBAR & CONFIGURATION ---
-st.sidebar.header("⚙️ Configuration")
+st.sidebar.header("⚙️ Fund Settings")
 
-# Extended List (Top 20 + ability to add any)
+# 1. UNIVERSE SELECTION
 TOP_CRYPTO = [
     'BTC-USD', 'ETH-USD', 'BNB-USD', 'SOL-USD', 'XRP-USD', 
     'ADA-USD', 'AVAX-USD', 'DOGE-USD', 'DOT-USD', 'MATIC-USD',
-    'LTC-USD', 'SHIB-USD', 'TRX-USD', 'LINK-USD', 'ATOM-USD',
-    'UNI-USD', 'XLM-USD', 'ETC-USD', 'FIL-USD', 'HBAR-USD'
+    'LINK-USD', 'UNI-USD', 'LTC-USD', 'ATOM-USD', 'XLM-USD'
 ]
 
-ticker_source = st.sidebar.radio("Ticker Source", ["Select from Top List", "Search/Type Custom"])
+# Allow selecting multiple assets for Portfolio Mode
+selected_assets = st.sidebar.multiselect("Portfolio Universe", TOP_CRYPTO, default=['BTC-USD', 'ETH-USD', 'SOL-USD'])
+benchmark_asset = 'BTC-USD' # For Beta calculation
 
-if ticker_source == "Select from Top List":
-    ticker = st.sidebar.selectbox("Select Asset", TOP_CRYPTO)
-else:
-    ticker = st.sidebar.text_input("Enter Ticker (e.g., PEPE-USD, AAPL)", value="BTC-USD").upper()
-
-# Date Range
-st.sidebar.subheader("📅 Timeframe")
-years_back = st.sidebar.slider("Years of History", 1, 5, 2)
+# 2. TIMEFRAME
+years_back = st.sidebar.slider("Lookback Period (Years)", 1, 5, 2)
 start_date = date.today() - timedelta(days=years_back*365)
 end_date = date.today()
 
-# --- HELPER FUNCTIONS ---
+# 3. MACRO DATA
+MACRO_TICKERS = {
+    'DXY (Dollar Index)': 'DX-Y.NYB',
+    'US10Y (Treasury Yield)': '^TNX',
+    'S&P 500': '^GSPC'
+}
 
-def calculate_rsi(data, window=14):
-    delta = data['Close'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=window).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=window).mean()
-    rs = gain / loss
-    return 100 - (100 / (1 + rs))
-
-def calculate_macd(data):
-    exp1 = data['Close'].ewm(span=12, adjust=False).mean()
-    exp2 = data['Close'].ewm(span=26, adjust=False).mean()
-    macd = exp1 - exp2
-    signal = macd.ewm(span=9, adjust=False).mean()
-    return macd, signal
-
+# --- DATA ENGINE ---
 @st.cache_data
-def load_data(ticker, start, end):
+def load_data(tickers, macro_tickers, start, end):
+    all_tickers = tickers + list(macro_tickers.values())
     try:
-        df = yf.download(ticker, start=start, end=end, progress=False)
+        data = yf.download(all_tickers, start=start, end=end, progress=False)['Close']
         
-        # Handle MultiIndex columns (yfinance update fix)
-        if isinstance(df.columns, pd.MultiIndex):
-            try:
-                df.columns = df.columns.droplevel('Ticker')
-            except:
-                df.columns = df.columns.get_level_values(-1)
-                
-        df.reset_index(inplace=True)
-        
-        # Ensure we have data
-        if df.empty:
-            return None
+        # Handle yfinance MultiIndex issue
+        if isinstance(data.columns, pd.MultiIndex):
+            data.columns = data.columns.droplevel('Ticker')
             
-        # Add Technical Indicators for AI & Charting
-        df['RSI'] = calculate_rsi(df)
-        df['MACD'], df['Signal'] = calculate_macd(df)
-        df['SMA_50'] = df['Close'].rolling(window=50).mean()
-        df['SMA_200'] = df['Close'].rolling(window=200).mean()
-        
-        # Bollinger Bands
-        df['BB_Middle'] = df['Close'].rolling(window=20).mean()
-        df['BB_Upper'] = df['BB_Middle'] + 2 * df['Close'].rolling(window=20).std()
-        df['BB_Lower'] = df['BB_Middle'] - 2 * df['Close'].rolling(window=20).std()
-        
-        # Drop NaN created by indicators
-        df.dropna(inplace=True)
-        
-        return df
+        return data
     except Exception as e:
-        return None
+        st.error(f"Data Load Error: {e}")
+        return pd.DataFrame()
 
-# --- LOAD DATA ---
-with st.spinner(f"Loading data for {ticker}..."):
-    data = load_data(ticker, start_date, end_date)
-
-if data is None or data.empty:
-    st.error(f"❌ Could not load data for {ticker}. Please check the symbol.")
-    st.stop()
-
-# --- MAIN DASHBOARD METRICS ---
-current_price = float(data['Close'].iloc[-1])
-prev_price = float(data['Close'].iloc[-2])
-daily_return = (current_price - prev_price) / prev_price
-
-# Risk Metrics Calculation
-data['Log_Return'] = np.log(data['Close'] / data['Close'].shift(1))
-annual_volatility = data['Log_Return'].std() * np.sqrt(365)
-sharpe_ratio = (data['Log_Return'].mean() * 365) / (data['Log_Return'].std() * np.sqrt(365)) if data['Log_Return'].std() != 0 else 0
-
-# Max Drawdown
-cumulative_returns = (1 + data['Log_Return']).cumprod()
-peak = cumulative_returns.expanding(min_periods=1).max()
-drawdown = (cumulative_returns / peak) - 1
-max_drawdown = drawdown.min()
-
-c1, c2, c3, c4, c5 = st.columns(5)
-c1.metric("Current Price", f"${current_price:,.2f}", f"{daily_return:.2%}")
-c2.metric("Volatility (Yearly)", f"{annual_volatility:.2%}")
-c3.metric("Sharpe Ratio", f"{sharpe_ratio:.2f}")
-c4.metric("Max Drawdown", f"{max_drawdown:.2%}")
-c5.metric("RSI (14)", f"{data['RSI'].iloc[-1]:.2f}")
-
-st.markdown("---")
-
-# --- TABS LOGIC ---
-tab_charts, tab_mc, tab_ai = st.tabs(["📊 Technical Charts", "🎲 Monte Carlo Simulation", "🤖 AI Prediction"])
-
-# ==========================================
-# TAB 1: TECHNICAL ANALYSIS
-# ==========================================
-with tab_charts:
-    st.subheader(f"Technical Analysis: {ticker}")
-    
-    # Chart Options
-    chart_opts = st.multiselect("Overlay Indicators", ["SMA 50", "SMA 200", "Bollinger Bands"], default=["SMA 50"])
-    
-    # Main Candle Chart
-    fig = go.Figure()
-    fig.add_trace(go.Candlestick(x=data['Date'],
-                open=data['Open'], high=data['High'],
-                low=data['Low'], close=data['Close'], name='Price'))
-    
-    if "SMA 50" in chart_opts:
-        fig.add_trace(go.Scatter(x=data['Date'], y=data['SMA_50'], line=dict(color='orange', width=1), name='SMA 50'))
-    if "SMA 200" in chart_opts:
-        fig.add_trace(go.Scatter(x=data['Date'], y=data['SMA_200'], line=dict(color='blue', width=1), name='SMA 200'))
-    if "Bollinger Bands" in chart_opts:
-        fig.add_trace(go.Scatter(x=data['Date'], y=data['BB_Upper'], line=dict(color='gray', width=0), showlegend=False, name='BB Upper'))
-        fig.add_trace(go.Scatter(x=data['Date'], y=data['BB_Lower'], line=dict(color='gray', width=0), fill='tonexty', fillcolor='rgba(200,200,200,0.2)', name='BB Range'))
-
-    fig.update_layout(height=600, xaxis_rangeslider_visible=False, title=f"{ticker} Price Action")
-    st.plotly_chart(fig, use_container_width=True)
-    
-    # Volume & MACD
-    col_v1, col_v2 = st.columns(2)
-    with col_v1:
-        st.markdown("**Volume Profile**")
-        st.bar_chart(data, x='Date', y='Volume', height=300)
-    with col_v2:
-        st.markdown("**MACD Oscillator**")
-        fig_macd = go.Figure()
-        fig_macd.add_trace(go.Scatter(x=data['Date'], y=data['MACD'], name='MACD'))
-        fig_macd.add_trace(go.Scatter(x=data['Date'], y=data['Signal'], name='Signal'))
-        fig_macd.update_layout(height=300, showlegend=True)
-        st.plotly_chart(fig_macd, use_container_width=True)
-
-# ==========================================
-# TAB 2: MONTE CARLO
-# ==========================================
-with tab_mc:
-    st.subheader("🎲 Monte Carlo Stochastic Simulation")
-    
-    mc_col_param, mc_col_vis = st.columns([1, 3])
-    
-    with mc_col_param:
-        st.info("Configuration")
-        mc_sims = st.slider("Simulations", 200, 2000, 500)
-        mc_days = st.slider("Forecast Horizon (Days)", 30, 365, 60)
-        st.markdown("""
-        **Methodology:**
-        Uses Geometric Brownian Motion (GBM).
-        $dS_t = \mu S_t dt + \sigma S_t dW_t$
-        """)
-    
-    with mc_col_vis:
-        # MC Logic
-        log_returns = np.log(1 + data['Close'].pct_change()).dropna()
-        u = log_returns.mean()
-        var = log_returns.var()
-        drift = u - (0.5 * var)
-        stdev = log_returns.std()
+with st.spinner("Fetching Institutional Data Feeds..."):
+    # Ensure at least one asset is selected
+    if not selected_assets:
+        st.warning("Please select at least one asset in the sidebar.")
+        st.stop()
         
-        daily_returns_sim = np.exp(drift + stdev * np.random.normal(0, 1, (mc_days, mc_sims)))
+    df_master = load_data(selected_assets, MACRO_TICKERS, start_date, end_date)
+    
+    # Calculate Log Returns for everyone
+    log_returns = np.log(df_master / df_master.shift(1)).dropna()
+
+# --- TAB STRUCTURE ---
+tab_port, tab_backtest, tab_risk, tab_macro = st.tabs([
+    "⚖️ Portfolio Optimizer", 
+    "🛠 Strategy Backtester", 
+    "⚠️ Risk Management (VaR)", 
+    "🌍 Macro Regime"
+])
+
+# ==========================================
+# TAB 1: PORTFOLIO OPTIMIZATION (Markowitz)
+# ==========================================
+with tab_port:
+    st.subheader("Mean-Variance Portfolio Optimization")
+    
+    if len(selected_assets) < 2:
+        st.warning("Select at least 2 assets to optimize a portfolio.")
+    else:
+        col_p1, col_p2 = st.columns([1, 2])
         
-        price_paths = np.zeros_like(daily_returns_sim)
-        price_paths[0] = data['Close'].iloc[-1]
-        
-        for t in range(1, mc_days):
-            price_paths[t] = price_paths[t-1] * daily_returns_sim[t]
+        # 1. Correlation Matrix
+        with col_p1:
+            st.markdown("**Correlation Matrix**")
+            corr_matrix = log_returns[selected_assets].corr()
+            fig_corr = px.imshow(corr_matrix, text_auto=True, color_continuous_scale='RdBu_r', zmin=-1, zmax=1)
+            st.plotly_chart(fig_corr, use_container_width=True)
             
-        fig_mc = go.Figure()
-        # Plot only first 100 paths for performance
-        for i in range(min(mc_sims, 100)):
-            fig_mc.add_trace(go.Scatter(y=price_paths[:, i], mode='lines', opacity=0.1, line=dict(color='cyan', width=1), showlegend=False))
-        
-        mean_path = np.mean(price_paths, axis=1)
-        fig_mc.add_trace(go.Scatter(y=mean_path, mode='lines', name='Average Path', line=dict(color='red', width=3)))
-        
-        fig_mc.update_layout(title=f"Projected Paths for next {mc_days} days", yaxis_title="Price ($)")
-        st.plotly_chart(fig_mc, use_container_width=True)
+        # 2. Efficient Frontier & Optimization
+        with col_p2:
+            st.markdown("**Efficient Frontier Solver**")
+            
+            # Helper functions for optimization
+            def portfolio_performance(weights, mean_returns, cov_matrix):
+                returns = np.sum(mean_returns * weights) * 252
+                std = np.sqrt(np.dot(weights.T, np.dot(cov_matrix, weights))) * np.sqrt(252)
+                return returns, std
 
-    # Statistics of Simulation
-    final_prices = price_paths[-1]
-    q5 = np.percentile(final_prices, 5)
-    q50 = np.percentile(final_prices, 50)
-    q95 = np.percentile(final_prices, 95)
+            def neg_sharpe_ratio(weights, mean_returns, cov_matrix, risk_free_rate=0.02):
+                p_ret, p_std = portfolio_performance(weights, mean_returns, cov_matrix)
+                return -(p_ret - risk_free_rate) / p_std
+
+            # Data prep
+            mu = log_returns[selected_assets].mean()
+            sigma = log_returns[selected_assets].cov()
+            num_assets = len(selected_assets)
+            args = (mu, sigma)
+            
+            # Constraints: Weights sum to 1, 0 <= weight <= 1
+            constraints = ({'type': 'eq', 'fun': lambda x: np.sum(x) - 1})
+            bounds = tuple((0, 1) for asset in range(num_assets))
+            init_guess = num_assets * [1. / num_assets,]
+            
+            # Run Optimization
+            result = minimize(neg_sharpe_ratio, init_guess, args=args, method='SLSQP', bounds=bounds, constraints=constraints)
+            
+            opt_weights = result.x
+            opt_ret, opt_vol = portfolio_performance(opt_weights, mu, sigma)
+            opt_sharpe = (opt_ret - 0.02) / opt_vol
+            
+            # Display Results
+            st.success(f"Optimal Sharpe Ratio: {opt_sharpe:.2f}")
+            
+            # Pie Chart of Weights
+            fig_pie = px.pie(values=opt_weights, names=selected_assets, title="Optimal Allocation")
+            st.plotly_chart(fig_pie, use_container_width=True)
+
+# ==========================================
+# TAB 2: STRATEGY BACKTESTER
+# ==========================================
+with tab_backtest:
+    st.subheader("Backtesting Engine (Vectorized)")
     
-    st.markdown("### Simulation Outcomes")
-    m1, m2, m3 = st.columns(3)
-    m1.metric("Bear Case (Bot 5%)", f"${q5:.2f}")
-    m2.metric("Base Case (Median)", f"${q50:.2f}")
-    m3.metric("Bull Case (Top 95%)", f"${q95:.2f}")
+    bt_col1, bt_col2 = st.columns([1, 3])
     
-    # Histogram
-    fig_hist = px.histogram(final_prices, nbins=50, title="Distribution of Predicted Prices")
-    fig_hist.add_vline(x=current_price, line_dash="dash", line_color="green", annotation_text="Current Price")
+    with bt_col1:
+        bt_asset = st.selectbox("Select Asset to Test", selected_assets)
+        sma_fast = st.number_input("Fast MA", value=20)
+        sma_slow = st.number_input("Slow MA", value=50)
+        initial_capital = st.number_input("Initial Capital ($)", value=10000)
+        
+    with bt_col2:
+        # Prepare Data
+        df_bt = pd.DataFrame(df_master[bt_asset]).dropna()
+        df_bt.columns = ['Close']
+        df_bt['Fast_MA'] = df_bt['Close'].rolling(window=sma_fast).mean()
+        df_bt['Slow_MA'] = df_bt['Close'].rolling(window=sma_slow).mean()
+        
+        # Signal: 1 (Long) when Fast > Slow, else 0 (Cash)
+        df_bt['Signal'] = np.where(df_bt['Fast_MA'] > df_bt['Slow_MA'], 1, 0)
+        df_bt['Position'] = df_bt['Signal'].shift(1) # Enter on next day open
+        
+        # Calculate Returns
+        df_bt['Market_Ret'] = df_bt['Close'].pct_change()
+        df_bt['Strategy_Ret'] = df_bt['Market_Ret'] * df_bt['Position']
+        
+        # Equity Curve
+        df_bt['Cumulative_Market'] = (1 + df_bt['Market_Ret']).cumprod() * initial_capital
+        df_bt['Cumulative_Strategy'] = (1 + df_bt['Strategy_Ret']).cumprod() * initial_capital
+        
+        # Drawdown Calculation
+        rolling_max = df_bt['Cumulative_Strategy'].cummax()
+        drawdown = (df_bt['Cumulative_Strategy'] - rolling_max) / rolling_max
+        max_drawdown = drawdown.min()
+        
+        # Metrics
+        total_return = (df_bt['Cumulative_Strategy'].iloc[-1] / initial_capital) - 1
+        
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Total Return", f"{total_return:.2%}")
+        m2.metric("Max Drawdown", f"{max_drawdown:.2%}", delta_color="inverse")
+        m3.metric("Final Equity", f"${df_bt['Cumulative_Strategy'].iloc[-1]:,.2f}")
+        
+        # Plot
+        fig_bt = go.Figure()
+        fig_bt.add_trace(go.Scatter(x=df_bt.index, y=df_bt['Cumulative_Market'], name='Buy & Hold', line=dict(color='gray', dash='dash')))
+        fig_bt.add_trace(go.Scatter(x=df_bt.index, y=df_bt['Cumulative_Strategy'], name='Strategy (MA Cross)', line=dict(color='green')))
+        st.plotly_chart(fig_bt, use_container_width=True)
+        
+        # Drawdown Plot
+        fig_dd = px.area(x=df_bt.index, y=drawdown, title="Drawdown Underwater Plot")
+        fig_dd.update_traces(line_color='red')
+        st.plotly_chart(fig_dd, use_container_width=True)
+
+# ==========================================
+# TAB 3: RISK MANAGEMENT (VaR/CVaR)
+# ==========================================
+with tab_risk:
+    st.subheader("⚠️ Institutional Risk Metrics")
+    
+    risk_asset = st.selectbox("Analyze Asset Risk", selected_assets, key='risk_select')
+    
+    # Calculate Metrics
+    returns = log_returns[risk_asset]
+    
+    # VaR (95% and 99%)
+    var_95 = np.percentile(returns, 5)
+    var_99 = np.percentile(returns, 1)
+    
+    # CVaR (Expected Shortfall) - Average of losses exceeding VaR
+    cvar_95 = returns[returns <= var_95].mean()
+    
+    # Beta Calculation (vs BTC as benchmark)
+    # Covariance(Asset, Benchmark) / Variance(Benchmark)
+    if risk_asset != benchmark_asset:
+        cov_matrix = np.cov(returns, log_returns[benchmark_asset])
+        beta = cov_matrix[0, 1] / cov_matrix[1, 1]
+    else:
+        beta = 1.0
+        
+    r1, r2, r3, r4 = st.columns(4)
+    r1.metric("Daily VaR (95%)", f"{var_95:.2%}", help="Minimum loss expected 5% of the time")
+    r2.metric("CVaR / Expected Shortfall", f"{cvar_95:.2%}", help="Average loss in worst 5% scenarios")
+    r3.metric("Beta (vs BTC)", f"{beta:.2f}", help=">1 means more volatile than BTC")
+    r4.metric("Annual Volatility", f"{returns.std() * np.sqrt(365):.2%}")
+    
+    # Visualizing Tail Risk
+    fig_hist = px.histogram(returns, nbins=100, title=f"Return Distribution & Tail Risk: {risk_asset}")
+    fig_hist.add_vline(x=var_95, line_dash="dash", line_color="red", annotation_text="VaR 95%")
     st.plotly_chart(fig_hist, use_container_width=True)
 
 # ==========================================
-# TAB 3: AI & MACHINE LEARNING
+# TAB 4: MACRO REGIME & AI FILTERS
 # ==========================================
-with tab_ai:
-    st.subheader("🤖 AI Trend Prediction (Random Forest)")
+with tab_macro:
+    st.subheader("🌍 Macro-Economic Regime")
     
-    ai_col1, ai_col2 = st.columns([1, 2])
+    col_m1, col_m2 = st.columns([2, 1])
     
-    with ai_col1:
-        st.write("### Model Settings")
-        prediction_days = st.slider("Predict Price in (Days)", 1, 30, 7)
-        st.info("The model trains on historical Price, Volume, RSI, MACD, and Moving Averages to predict future movement.")
+    with col_m1:
+        # Plot DXY and Yields
+        fig_macro = go.Figure()
+        # Normalize data to compare trends
+        dxy = df_master[MACRO_TICKERS['DXY (Dollar Index)']]
+        yields = df_master[MACRO_TICKERS['US10Y (Treasury Yield)']]
         
-    with ai_col2:
-        # Prepare Data for ML
-        df_ml = data.copy()
+        fig_macro.add_trace(go.Scatter(x=dxy.index, y=dxy, name='DXY (Dollar)', yaxis='y1'))
+        fig_macro.add_trace(go.Scatter(x=yields.index, y=yields, name='US 10Y Yields', yaxis='y2', line=dict(dash='dot')))
         
-        # Target: Future Price
-        df_ml['Target'] = df_ml['Close'].shift(-prediction_days)
+        fig_macro.update_layout(
+            title="Macro Headwinds: Dollar & Rates",
+            yaxis=dict(title="DXY"),
+            yaxis2=dict(title="Yields %", overlaying="y", side="right")
+        )
+        st.plotly_chart(fig_macro, use_container_width=True)
         
-        # Features
-        feature_cols = ['Close', 'Volume', 'RSI', 'MACD', 'SMA_50', 'SMA_200', 'BB_Upper', 'BB_Lower']
-        df_ml.dropna(inplace=True) # Drop NaNs
+    with col_m2:
+        st.write("### Regime Filter")
         
-        X = df_ml[feature_cols]
-        y = df_ml['Target']
+        # Simple Regime Logic
+        dxy_sma_50 = dxy.rolling(50).mean().iloc[-1]
+        dxy_current = dxy.iloc[-1]
         
-        # Train/Test Split
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
-        
-        # Model
-        model = RandomForestRegressor(n_estimators=100, random_state=42, max_depth=10)
-        model.fit(X_train, y_train)
-        
-        # Evaluate
-        preds = model.predict(X_test)
-        mae = mean_absolute_error(y_test, preds)
-        r2 = model.score(X_test, y_test)
-        
-        # Predict Future
-        # Get latest data row for features
-        latest_features = data[feature_cols].iloc[[-1]] 
-        future_pred = model.predict(latest_features)[0]
-        
-        pct_change = (future_pred - current_price) / current_price
-        
-        # Display Result
-        st.markdown(f"### Prediction for {prediction_days} days from now")
-        
-        res_col1, res_col2 = st.columns(2)
-        res_col1.metric("Predicted Price", f"${future_pred:.2f}")
-        
-        color = "grey"
-        signal = "NEUTRAL"
-        if pct_change > 0.02: 
-            color = "green"
-            signal = "BUY"
-        elif pct_change < -0.02: 
-            color = "red"
-            signal = "SELL"
-            
-        res_col1.markdown(f"**Potential Upside/Downside:** <span style='color:{color}'>{pct_change:.2%}</span>", unsafe_allow_html=True)
-        res_col2.markdown(f"<h1 style='color:{color}; text-align: center;'>{signal}</h1>", unsafe_allow_html=True)
-        
-        st.write(f"Model Error (MAE): ${mae:.2f} | R² Score: {r2:.2f}")
+        regime = "RISK ON ✅"
+        if dxy_current > dxy_sma_50:
+            regime = "RISK OFF 🛑"
+            st.error(f"Macro Regime: {regime}")
+            st.write("The Dollar is trending UP. Crypto assets are highly correlated to liquidity. Caution is advised.")
+        else:
+            st.success(f"Macro Regime: {regime}")
+            st.write("The Dollar is weak. Favorable environment for Risk Assets.")
 
-    st.markdown("---")
-    
-    # Feature Importance Visualization
-    st.subheader("🧠 What is driving the AI?")
-    importances = model.feature_importances_
-    feature_df = pd.DataFrame({'Feature': feature_cols, 'Importance': importances}).sort_values(by='Importance', ascending=False)
-    
-    fig_imp = px.bar(feature_df, x='Importance', y='Feature', orientation='h', title="Feature Importance Analysis")
-    st.plotly_chart(fig_imp, use_container_width=True)
-
-    # Backtest Chart
-    st.subheader("Backtest: Real vs Predicted (Test Set)")
-    fig_backtest = go.Figure()
-    fig_backtest.add_trace(go.Scatter(y=y_test.values, name='Actual Price', line=dict(color='blue')))
-    fig_backtest.add_trace(go.Scatter(y=preds, name='AI Predicted', line=dict(color='orange', dash='dash')))
-    st.plotly_chart(fig_backtest, use_container_width=True)
-
-# --- FOOTER ---
 st.markdown("---")
-st.caption("Disclaimer: This tool is for educational purposes only. Cryptocurrency trading involves high risk. This is not financial advice.")
+st.caption("Institutional Terminal v2.0 | Not Financial Advice")
